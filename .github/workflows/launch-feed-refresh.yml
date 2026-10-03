@@ -1,0 +1,321 @@
+# Mission Control shared launch feed: the single scheduled producer.
+#
+# Publish this file unchanged to the PUBLIC repo jaguirre2192/mission-control-support
+# at .github/workflows/launch-feed-refresh.yml on main. The Worker's OIDC check
+# pins that exact repository, branch and workflow path.
+#
+# No secrets: the job authenticates to the Worker with a short-lived GitHub OIDC
+# token (audience = Worker origin). The Worker hands out claims with a fixed LL2
+# URL, owns the 10-requests-per-rolling-hour budget and the cooldown, and never
+# contacts LL2 itself. This job fetches LL2 from the runner, projects each
+# record to the fields the app decodes, and publishes the result.
+name: launch-feed-refresh
+
+on:
+  schedule:
+    # Every 10 minutes, off the top-of-hour peak.
+    - cron: "3,13,23,33,43,53 * * * *"
+    # Weekly metadata commit prevents public workflow inactivity suspension.
+    - cron: "7 0 * * 0"
+  workflow_dispatch:
+    inputs:
+      resource:
+        description: "Resource to try (still subject to due time, budget and cooldown)"
+        type: choice
+        options: [upcoming, previous, astronauts, due]
+        default: upcoming
+
+concurrency:
+  group: mission-control-shared-feed
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  refresh:
+    if: github.event.schedule != '7 0 * * 0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - name: Refresh shared launch feed
+        env:
+          FEED_ONLY: ${{ inputs.resource || 'due' }}
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys, urllib.error, urllib.parse, urllib.request
+          from datetime import datetime, timezone
+
+          FEED_ORIGIN = "https://mission-control-feed.jorgeaguirre-chronicle.workers.dev"
+          UPSTREAM = {
+              "upcoming": "https://ll.thespacedevs.com/2.3.0/launches/upcoming/?mode=normal&limit=50&ordering=net",
+              "previous": "https://ll.thespacedevs.com/2.3.0/launches/previous/?mode=normal&limit=50&ordering=-net",
+              "astronauts": "https://ll.thespacedevs.com/2.3.0/astronauts/?in_space=true&limit=50&ordering=name&mode=detailed",
+          }
+          ORDER = ["upcoming", "previous", "astronauts"]
+          UPSTREAM_TIMEOUT_S = 20
+          MAX_UPSTREAM_BYTES = 8 * 1024 * 1024
+          USER_AGENT = "MissionControlFeed/1.0 (GitHub Actions shared snapshot producer)"
+
+          class NoRedirect(urllib.request.HTTPRedirectHandler):
+              def redirect_request(self, *args, **kwargs):
+                  return None
+
+          opener = urllib.request.build_opener(NoRedirect)
+
+          def log(message):
+              print(message, flush=True)
+
+          def oidc_token():
+              url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL")
+              bearer = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
+              if not url or not bearer:
+                  raise SystemExit("OIDC is unavailable (id-token: write missing)")
+              sep = "&" if "?" in url else "?"
+              req = urllib.request.Request(
+                  url + sep + "audience=" + urllib.parse.quote(FEED_ORIGIN, safe=""),
+                  headers={"Authorization": "bearer " + bearer, "Accept": "application/json"},
+              )
+              with urllib.request.urlopen(req, timeout=15) as resp:
+                  value = json.load(resp).get("value")
+              if not isinstance(value, str) or value.count(".") != 2:
+                  raise SystemExit("OIDC token response was malformed")
+              return value
+
+          def worker_post(path, token, payload):
+              data = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+              req = urllib.request.Request(
+                  FEED_ORIGIN + path, data=data, method="POST",
+                  headers={"Authorization": "Bearer " + token, "Content-Type": "application/json",
+                           "Accept": "application/json", "User-Agent": USER_AGENT},
+              )
+              try:
+                  with opener.open(req, timeout=30) as resp:
+                      return resp.status, json.load(resp)
+              except urllib.error.HTTPError as err:
+                  try:
+                      body = json.loads(err.read(4096) or b"{}")
+                  except ValueError:
+                      body = {}
+                  return err.code, body
+
+          # --- Projection: exactly the fields LLLaunch / WLLResponse / PeopleInSpaceClient decode.
+          def obj(v):
+              return v if isinstance(v, dict) else None
+
+          def s(v):
+              return v if isinstance(v, str) else None
+
+          def i(v):
+              return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+          def named(v):
+              v = obj(v)
+              return {"id": v["id"], "name": v["name"]} if v and i(v.get("id")) is not None and s(v.get("name")) else None
+
+          def image(v):
+              if isinstance(v, str):
+                  return {"image_url": v, "thumbnail_url": None}
+              v = obj(v)
+              if not v or not (s(v.get("image_url")) or s(v.get("thumbnail_url"))):
+                  return None
+              return {"image_url": s(v.get("image_url")), "thumbnail_url": s(v.get("thumbnail_url"))}
+
+          def country(v):
+              v = obj(v)
+              return {"alpha_3_code": v["alpha_3_code"]} if v and s(v.get("alpha_3_code")) else None
+
+          def countries(v):
+              items = v if isinstance(v, list) else ([v] if isinstance(v, dict) else [])
+              return [c for c in map(country, items) if c]
+
+          def project_launch(x):
+              m, a, r, p = obj(x.get("mission")), obj(x.get("launch_service_provider")), obj(x.get("rocket")), obj(x.get("pad"))
+              st = obj(x.get("status")) or {}
+              c = obj(r.get("configuration")) if r else None
+              loc = obj(p.get("location")) if p else None
+              orbit = obj(m.get("orbit")) if m else None
+              return {
+                  "id": x.get("id"),
+                  "name": x.get("name"),
+                  "status": {"id": st.get("id"), "name": st.get("name"), "abbrev": s(st.get("abbrev"))},
+                  "net": s(x.get("net")),
+                  "image": image(x.get("image")),
+                  "mission": {
+                      "id": m.get("id"), "name": m.get("name"),
+                      "description": s(m.get("description")), "type": s(m.get("type")),
+                      "orbit": {"name": orbit["name"], "abbrev": s(orbit.get("abbrev"))} if orbit and s(orbit.get("name")) else None,
+                  } if m else None,
+                  "vid_urls": [
+                      {"url": v["url"], "title": s(v.get("title"))}
+                      for v in (x.get("vid_urls") or []) if isinstance(v, dict) and s(v.get("url"))
+                  ][:20],
+                  "launch_service_provider": {
+                      "id": a.get("id"), "name": a.get("name"), "abbrev": s(a.get("abbrev")),
+                      "type": named(a.get("type")), "description": s(a.get("description")),
+                      "country": countries(a.get("country")), "logo": image(a.get("logo")),
+                  } if a else None,
+                  "rocket": {
+                      "id": r.get("id"),
+                      "configuration": {
+                          "id": c.get("id"), "name": c.get("name"),
+                          "full_name": s(c.get("full_name")), "variant": s(c.get("variant")),
+                          "families": [f for f in map(named, c.get("families") or []) if f],
+                      } if c else None,
+                  } if r else None,
+                  "pad": {
+                      "id": p.get("id"), "name": p.get("name"),
+                      "location": {"id": loc.get("id"), "name": loc.get("name"), "country": country(loc.get("country"))} if loc else None,
+                  } if p else None,
+              }
+
+          def project_astronaut(x):
+              t = obj(x.get("type"))
+              flights = []
+              for f in x.get("flights") or []:
+                  if not isinstance(f, dict) or not s(f.get("name")):
+                      continue
+                  fm = obj(f.get("mission"))
+                  flights.append({
+                      "name": f["name"],
+                      "net": s(f.get("net")),
+                      "mission": {"name": fm["name"]} if fm and s(fm.get("name")) else None,
+                      "program": [{"name": pr["name"]} for pr in (f.get("program") or []) if isinstance(pr, dict) and s(pr.get("name"))],
+                  })
+              return {
+                  "id": x.get("id"),
+                  "name": x.get("name"),
+                  "type": {"name": t["name"]} if t and s(t.get("name")) else None,
+                  "flights": flights,
+              }
+
+          def fetch_upstream(url):
+              """One request, no retries. Returns (status, retry_after, error, completed_at, results)."""
+              req = urllib.request.Request(url, headers={"Accept": "application/json", "User-Agent": USER_AGENT})
+              try:
+                  resp = opener.open(req, timeout=UPSTREAM_TIMEOUT_S)
+              except urllib.error.HTTPError as err:
+                  status = err.code
+                  retry_after = err.headers.get("Retry-After")
+                  err.close()
+                  error = "redirect" if 300 <= status < 400 else None
+                  return status, retry_after, error, None, None
+              except Exception as exc:
+                  timeout = "timed out" in str(exc).lower() or isinstance(exc, TimeoutError)
+                  return None, None, "timeout" if timeout else "network_error", None, None
+              with resp:
+                  status = resp.status
+                  try:
+                      raw = resp.read(MAX_UPSTREAM_BYTES + 1)
+                  except Exception as exc:
+                      timeout = "timed out" in str(exc).lower() or isinstance(exc, TimeoutError)
+                      return status, None, "timeout" if timeout else "network_error", None, None
+              completed = datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+              if status != 200:
+                  return status, None, None, completed, None
+              if len(raw) > MAX_UPSTREAM_BYTES:
+                  return status, None, "too_large", completed, None
+              try:
+                  payload = json.loads(raw.decode("utf-8"))
+              except UnicodeDecodeError:
+                  return status, None, "invalid_encoding", completed, None
+              except ValueError:
+                  return status, None, "invalid_json", completed, None
+              results = payload.get("results") if isinstance(payload, dict) else None
+              if not isinstance(results, list):
+                  return status, None, "missing_results", completed, None
+              if not results:
+                  return status, None, "empty_results", completed, None
+              if len(results) > 50:
+                  return status, None, "too_many_results", completed, None
+              return status, None, None, completed, results
+
+          only = os.environ.get("FEED_ONLY", "due")
+          if only not in ("due", *ORDER):
+              raise SystemExit("invalid resource input")
+          resources = ORDER if only == "due" else [only]
+
+          token = oidc_token()
+          failed = False
+          for resource in resources:
+              status, claim = worker_post("/internal/v1/claim", token, {"resource": resource})
+              if status != 200:
+                  log(f"{resource}: claim rejected HTTP {status} {claim.get('error', '')}")
+                  failed = True
+                  break
+              if not claim.get("claimed"):
+                  extra = f" until {claim['retry_at']}" if claim.get("retry_at") else ""
+                  log(f"{resource}: skipped ({claim.get('reason', 'unknown')}{extra})")
+                  if claim.get("reason") in ("cooldown", "budget"):
+                      break
+                  continue
+
+              url = claim.get("upstream_url")
+              ctoken = claim.get("claim_token")
+              if url != UPSTREAM[resource] or not isinstance(ctoken, str) or not re.fullmatch(r"[0-9a-f-]{36}", ctoken):
+                  log(f"{resource}: claim carried an unexpected upstream URL or token; not fetching")
+                  failed = True
+                  break
+
+              up_status, retry_after, error, completed, results = fetch_upstream(url)
+              projected = None
+              if up_status == 200 and error is None:
+                  try:
+                      project = project_astronaut if resource == "astronauts" else project_launch
+                      projected = [project(x) if isinstance(x, dict) else x for x in results]
+                  except Exception:
+                      error = "projection_failed"
+              publish = {
+                  "resource": resource,
+                  "claim_token": ctoken,
+                  "upstream_status": up_status,
+                  "retry_after": retry_after[:64] if isinstance(retry_after, str) else None,
+                  "error": error,
+                  "completed_at": completed,
+              }
+              if projected is not None:
+                  publish["results"] = projected
+              status, result = worker_post("/internal/v1/publish", token, publish)
+              if status == 200 and result.get("recorded") == "success":
+                  log(f"{resource}: published {result.get('result_count')} records, "
+                      f"fetched_at {result.get('fetched_at')} ({result.get('timestamp_source')})")
+                  continue
+
+              failed = True
+              detail = result.get("code") or result.get("error") or ""
+              log(f"{resource}: upstream HTTP {up_status} error={error}; publish HTTP {status} {detail}")
+              if up_status in (429, 503):
+                  log("Upstream asked us to back off; the Worker set the producer cooldown. Stopping.")
+                  break
+
+          sys.exit(1 if failed else 0)
+          PY
+
+  heartbeat:
+    if: github.event_name == 'schedule' && github.event.schedule == '7 0 * * 0'
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: write
+      id-token: none
+    steps:
+      - name: Keep scheduled feed active
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PYHEART'
+          import base64, json, os, urllib.request, urllib.error
+          from datetime import datetime, timezone
+          url = "https://api.github.com/repos/jaguirre2192/mission-control-support/contents/.github/launch-feed-heartbeat.txt"
+          headers = {"Authorization": "Bearer " + os.environ["GH_TOKEN"], "Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"}
+          payload = {"message": "Keep shared launch feed schedule active", "branch": "main", "content": base64.b64encode((datetime.now(timezone.utc).isoformat() + "\n").encode()).decode()}
+          try:
+              with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=15) as response:
+                  payload["sha"] = json.load(response)["sha"]
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+          with urllib.request.urlopen(urllib.request.Request(url, data=json.dumps(payload).encode(), headers={**headers, "Content-Type": "application/json"}, method="PUT"), timeout=15) as response:
+              print("Scheduled feed activity recorded:", response.status)
+          PYHEART
