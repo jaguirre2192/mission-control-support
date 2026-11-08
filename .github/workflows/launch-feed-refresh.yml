@@ -67,6 +67,17 @@ jobs:
           def log(message):
               print(message, flush=True)
 
+          def annotate(level, message):
+              # Workflow annotations show on the public run page and in the alert
+              # email without signing in, unlike the step log.
+              print(f"::{level} title=launch-feed-refresh::{message}", flush=True)
+
+          # Launch Library being slow, unreachable or rate limiting is expected now
+          # and then. The Worker records it and keeps serving the last good
+          # snapshot, so it is a warning, not a failed run.
+          TRANSIENT_UPSTREAM_ERRORS = ("timeout", "network_error")
+          TRANSIENT_UPSTREAM_STATUSES = (429, 500, 502, 503, 504)
+
           def oidc_token():
               url = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_URL")
               bearer = os.environ.get("ACTIONS_ID_TOKEN_REQUEST_TOKEN")
@@ -99,6 +110,9 @@ jobs:
                   except ValueError:
                       body = {}
                   return err.code, body
+              except Exception as exc:
+                  # Timeouts and connection errors used to escape as a traceback.
+                  return None, {"error": type(exc).__name__}
 
           # --- Projection: exactly the fields LLLaunch / WLLResponse / PeopleInSpaceClient decode.
           def obj(v):
@@ -241,7 +255,7 @@ jobs:
           for resource in resources:
               status, claim = worker_post("/internal/v1/claim", token, {"resource": resource})
               if status != 200:
-                  log(f"{resource}: claim rejected HTTP {status} {claim.get('error', '')}")
+                  annotate("error", f"{resource}: claim rejected HTTP {status} {claim.get('error', '')}")
                   failed = True
                   break
               if not claim.get("claimed"):
@@ -254,7 +268,7 @@ jobs:
               url = claim.get("upstream_url")
               ctoken = claim.get("claim_token")
               if url != UPSTREAM[resource] or not isinstance(ctoken, str) or not re.fullmatch(r"[0-9a-f-]{36}", ctoken):
-                  log(f"{resource}: claim carried an unexpected upstream URL or token; not fetching")
+                  annotate("error", f"{resource}: claim carried an unexpected upstream URL or token; not fetching")
                   failed = True
                   break
 
@@ -282,9 +296,15 @@ jobs:
                       f"fetched_at {result.get('fetched_at')} ({result.get('timestamp_source')})")
                   continue
 
-              failed = True
               detail = result.get("code") or result.get("error") or ""
-              log(f"{resource}: upstream HTTP {up_status} error={error}; publish HTTP {status} {detail}")
+              summary = f"{resource}: upstream HTTP {up_status} error={error}; publish HTTP {status} {detail}"
+              transient = error in TRANSIENT_UPSTREAM_ERRORS or up_status in TRANSIENT_UPSTREAM_STATUSES
+              if status == 200 and transient:
+                  # The Worker accepted the failure report; the next run retries.
+                  annotate("warning", summary)
+              else:
+                  annotate("error", summary)
+                  failed = True
               if up_status in (429, 503):
                   log("Upstream asked us to back off; the Worker set the producer cooldown. Stopping.")
                   break
